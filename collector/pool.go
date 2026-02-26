@@ -396,8 +396,10 @@ func (c *PoolCollector) getPoolLogicalIO(poolName string) (poolIO, error) {
 }
 
 // getPoolDisks parses `zpool status` to extract the disk device names for each pool.
-// It looks for lines in the config section that reference /dev/disk/by-id/ or device names
-// like sda, nvme0n1, etc. Returns a map of pool name → list of short device names (e.g. "sda").
+// It identifies disk lines in the config section by excluding known ZFS keywords (mirror,
+// raidz, spare, log, cache, etc.) and the pool name itself. Each remaining name is resolved
+// to a short Linux block device name (e.g. "sda") via /dev/disk/by-id/ symlink resolution.
+// Returns a map of pool name → list of short device names.
 func (c *PoolCollector) getPoolDisks() (map[string][]string, error) {
 	cmd := c.zpoolCommand("status")
 	var stdout, stderr bytes.Buffer
@@ -406,6 +408,14 @@ func (c *PoolCollector) getPoolDisks() (map[string][]string, error) {
 
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("zpool status failed: %w (%s)", err, stderr.String())
+	}
+
+	// ZFS keywords that appear in the config section but are NOT disk names.
+	zpoolKeywords := map[string]bool{
+		"NAME": true, "STATE": true, "READ": true, "WRITE": true, "CKSUM": true,
+		"mirror": true, "raidz1": true, "raidz2": true, "raidz3": true,
+		"stripe": true, "cache": true, "log": true, "spare": true, "special": true,
+		"dedup": true, "replacing": true, "logs": true, "spares": true,
 	}
 
 	result := make(map[string][]string)
@@ -436,19 +446,37 @@ func (c *PoolCollector) getPoolDisks() (map[string][]string, error) {
 		}
 
 		fields := strings.Fields(trimmed)
-		if len(fields) < 1 {
+		if len(fields) < 2 {
 			continue
 		}
 
 		devName := fields[0]
 
-		// Resolve /dev/disk/by-id/ symlinks to get the real device name
-		if strings.Contains(devName, "-") || strings.HasPrefix(devName, "sd") || strings.HasPrefix(devName, "nvme") || strings.HasPrefix(devName, "da") {
-			// Try to resolve via /dev/disk/by-id/ first
-			resolved := c.resolveDeviceName(devName)
-			if resolved != "" {
-				result[currentPool] = append(result[currentPool], resolved)
+		// Skip the pool name itself (appears as the top-level vdev)
+		if devName == currentPool {
+			continue
+		}
+
+		// Skip known ZFS keywords (vdev types, header columns)
+		// Also skip mirror-N, raidz1-N variants
+		baseName := devName
+		if idx := strings.LastIndex(baseName, "-"); idx != -1 {
+			prefix := baseName[:idx]
+			if zpoolKeywords[prefix] {
+				continue
 			}
+		}
+		if zpoolKeywords[devName] {
+			continue
+		}
+
+		// Try to resolve this name to a short block device name
+		resolved := c.resolveDeviceName(devName)
+		if resolved != "" {
+			result[currentPool] = append(result[currentPool], resolved)
+			c.logger.Debug("mapped disk to pool", "disk", resolved, "pool", currentPool, "original", devName)
+		} else {
+			c.logger.Debug("could not resolve disk name", "name", devName, "pool", currentPool)
 		}
 	}
 
@@ -460,11 +488,13 @@ func (c *PoolCollector) getPoolDisks() (map[string][]string, error) {
 //   - Short names already (sda, nvme0n1) → returned as-is
 //   - /dev/disk/by-id/ style names → resolved via symlink
 //   - Names with partition suffixes (-partN) → stripped to get the whole device
+//   - TrueNAS GUID/serial style names → tries all /dev/disk/ subdirectories
 func (c *PoolCollector) resolveDeviceName(devName string) string {
-	// Remove partition suffix if present (e.g. "-part2" or "p1")
+	// Remove partition suffix if present (e.g. "-part2", "-part3", "p1")
 	baseDev := devName
-	for _, suffix := range []string{"-part1", "-part2", "-part3", "-part4", "-part5", "-part6", "-part7", "-part8", "-part9"} {
-		baseDev = strings.TrimSuffix(baseDev, suffix)
+	for i := 1; i <= 9; i++ {
+		baseDev = strings.TrimSuffix(baseDev, fmt.Sprintf("-part%d", i))
+		baseDev = strings.TrimSuffix(baseDev, fmt.Sprintf("p%d", i))
 	}
 
 	// If it's already a short name like sda, nvme0n1, etc.
@@ -472,24 +502,87 @@ func (c *PoolCollector) resolveDeviceName(devName string) string {
 		return baseDev
 	}
 
-	// Try to resolve via /dev/disk/by-id/ symlink
-	byIDPath := filepath.Join(c.opts.ProcPath, "..", "dev", "disk", "by-id", baseDev)
+	// Determine the dev root path
+	devRoot := "/dev"
 	if c.opts.IsContainer() {
-		byIDPath = filepath.Join(c.opts.RootfsPath, "dev", "disk", "by-id", baseDev)
+		devRoot = filepath.Join(c.opts.RootfsPath, "dev")
 	}
 
-	target, err := os.Readlink(byIDPath)
+	// Try resolving via multiple /dev/disk/ subdirectories
+	// TrueNAS uses GPT partition UUIDs in zpool status, so by-partuuid is critical
+	for _, subDir := range []string{"by-partuuid", "by-id", "by-vdev", "by-path"} {
+		// Try the full name first, then just the base (without partition)
+		for _, candidate := range []string{devName, baseDev} {
+			linkPath := filepath.Join(devRoot, "disk", subDir, candidate)
+			target, err := os.Readlink(linkPath)
+			if err != nil {
+				continue
+			}
+
+			// target is relative like ../../sda or ../../sda2
+			shortName := filepath.Base(target)
+
+			// Strip partition number from resolved name (e.g. sda2 → sda)
+			shortName = stripPartition(shortName)
+
+			if isShortDevName(shortName) {
+				return shortName
+			}
+		}
+	}
+
+	// Last resort: scan /dev/disk/by-id/ for any symlink containing our device name
+	byIDDir := filepath.Join(devRoot, "disk", "by-id")
+	entries, err := os.ReadDir(byIDDir)
 	if err != nil {
 		return ""
 	}
-
-	// target is relative like ../../sda
-	shortName := filepath.Base(target)
-	if isShortDevName(shortName) {
-		return shortName
+	for _, entry := range entries {
+		if !strings.Contains(entry.Name(), baseDev) {
+			continue
+		}
+		linkPath := filepath.Join(byIDDir, entry.Name())
+		target, err := os.Readlink(linkPath)
+		if err != nil {
+			continue
+		}
+		shortName := stripPartition(filepath.Base(target))
+		if isShortDevName(shortName) {
+			return shortName
+		}
 	}
 
 	return ""
+}
+
+// stripPartition removes trailing partition numbers from device names.
+// e.g., "sda2" → "sda", "nvme0n1p3" → "nvme0n1", "sdb" → "sdb"
+func stripPartition(name string) string {
+	// Handle NVMe partitions: nvme0n1p1 → nvme0n1
+	if strings.HasPrefix(name, "nvme") {
+		if idx := strings.LastIndex(name, "p"); idx > 0 {
+			suffix := name[idx+1:]
+			allDigits := len(suffix) > 0
+			for _, c := range suffix {
+				if c < '0' || c > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				return name[:idx]
+			}
+		}
+		return name
+	}
+
+	// Handle sd/vd/xvd/da partitions: sda2 → sda, vdb1 → vdb
+	// Remove trailing digits
+	trimmed := strings.TrimRight(name, "0123456789")
+	if isShortDevName(trimmed) && trimmed != name {
+		return trimmed
+	}
+	return name
 }
 
 // isShortDevName checks if a name looks like a Linux block device (sda, nvme0n1, etc.)
