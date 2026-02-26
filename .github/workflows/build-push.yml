@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 env:
   REGISTRY: ghcr.io
@@ -14,6 +17,8 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # Skip if triggered by a failed Release workflow
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
 
     permissions:
       contents: read
@@ -22,6 +27,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_branch || github.ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
