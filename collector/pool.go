@@ -292,17 +292,26 @@ func (c *PoolCollector) getPoolErrors() (map[string]poolErrors, error) {
 }
 
 type poolIO struct {
-	readOps  int64
-	writeOps int64
+	readOps    int64
+	writeOps   int64
 	readBytes  int64
 	writeBytes int64
 }
 
-// getPoolIO reads cumulative I/O counters from /proc/spl/kstat/zfs/<pool>/io.
-// The file format (Linux) has a header line and a data line with space-separated fields:
-//   nread  nwritten  reads  writes  wtime  wlentime  wupdate  rtime  rlentime  rupdate  wcnt  rcnt
+// getPoolIO reads cumulative I/O counters from /proc/spl/kstat/zfs/<pool>/iostats.
+// The file is a key-value format:
+//
+//	name                            type data
+//	arc_read_count                  4    199036228
+//	arc_read_bytes                  4    1214200522240
+//	arc_write_count                 4    1320100954
+//	arc_write_bytes                 4    5710941484686
+//	direct_read_count               4    0
+//	direct_read_bytes               4    0
+//	direct_write_count              4    0
+//	direct_write_bytes              4    0
 func (c *PoolCollector) getPoolIO(poolName string) (poolIO, error) {
-	ioPath := c.opts.ProcPath + "/spl/kstat/zfs/" + poolName + "/io"
+	ioPath := c.opts.ProcPath + "/spl/kstat/zfs/" + poolName + "/iostats"
 	cmd := exec.Command("cat", ioPath)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -312,35 +321,24 @@ func (c *PoolCollector) getPoolIO(poolName string) (poolIO, error) {
 		return poolIO{}, err
 	}
 
-	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
-	// We need at least 3 lines: header comment, column names, data.
-	// Sometimes it's just 2 lines: header and data.
-	var dataLine string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "name") || strings.HasPrefix(line, "type") {
+	stats := make(map[string]int64)
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		fields := strings.Fields(line)
+		// Format: name  type  value
+		if len(fields) != 3 {
 			continue
 		}
-		// First non-header line is the data line.
-		dataLine = line
-		break
+		// Skip header line
+		if fields[0] == "name" {
+			continue
+		}
+		stats[fields[0]] = parseInt64(fields[2])
 	}
 
-	if dataLine == "" {
-		return poolIO{}, nil
-	}
-
-	fields := strings.Fields(dataLine)
-	if len(fields) < 4 {
-		c.logger.Warn("unexpected io kstat format", "pool", poolName, "line", dataLine)
-		return poolIO{}, nil
-	}
-
-	// Fields: nread nwritten reads writes ...
 	return poolIO{
-		readBytes:  parseInt64(fields[0]),
-		writeBytes: parseInt64(fields[1]),
-		readOps:    parseInt64(fields[2]),
-		writeOps:   parseInt64(fields[3]),
+		readOps:    stats["arc_read_count"] + stats["direct_read_count"],
+		writeOps:   stats["arc_write_count"] + stats["direct_write_count"],
+		readBytes:  stats["arc_read_bytes"] + stats["direct_read_bytes"],
+		writeBytes: stats["arc_write_bytes"] + stats["direct_write_bytes"],
 	}, nil
 }
