@@ -1,9 +1,13 @@
 package collector
 
 import (
+	"bufio"
 	"bytes"
+	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -21,10 +25,14 @@ type PoolCollector struct {
 	readErrors       *prometheus.Desc
 	writeErrors      *prometheus.Desc
 	checksumErrors   *prometheus.Desc
-	ioReadOps        *prometheus.Desc
-	ioWriteOps       *prometheus.Desc
-	ioReadBytes      *prometheus.Desc
-	ioWriteBytes     *prometheus.Desc
+	logicalReadOps   *prometheus.Desc
+	logicalWriteOps  *prometheus.Desc
+	logicalReadBytes *prometheus.Desc
+	logicalWriteBytes *prometheus.Desc
+	physicalReadOps   *prometheus.Desc
+	physicalWriteOps  *prometheus.Desc
+	physicalReadBytes *prometheus.Desc
+	physicalWriteBytes *prometheus.Desc
 
 	opts   Options
 	logger *slog.Logger
@@ -87,24 +95,44 @@ func NewPoolCollector(logger *slog.Logger, opts Options) *PoolCollector {
 			"Total checksum errors for the pool (top-level vdev).",
 			poolLabels, nil,
 		),
-		ioReadOps: prometheus.NewDesc(
-			"zfs_pool_read_ops_total",
-			"Total read operations for the pool (cumulative counter).",
+		logicalReadOps: prometheus.NewDesc(
+			"zfs_pool_logical_read_ops_total",
+			"Total logical read operations for the pool — all reads requested via the ARC subsystem, including both cache hits and disk reads (cumulative counter from iostats).",
 			poolLabels, nil,
 		),
-		ioWriteOps: prometheus.NewDesc(
-			"zfs_pool_write_ops_total",
-			"Total write operations for the pool (cumulative counter).",
+		logicalWriteOps: prometheus.NewDesc(
+			"zfs_pool_logical_write_ops_total",
+			"Total logical write operations for the pool — all writes passing through the ARC/DMU path (cumulative counter from iostats).",
 			poolLabels, nil,
 		),
-		ioReadBytes: prometheus.NewDesc(
-			"zfs_pool_read_bytes_total",
-			"Total bytes read from the pool (cumulative counter).",
+		logicalReadBytes: prometheus.NewDesc(
+			"zfs_pool_logical_read_bytes_total",
+			"Total logical bytes read from the pool — includes ARC cache hits and disk reads (cumulative counter from iostats).",
 			poolLabels, nil,
 		),
-		ioWriteBytes: prometheus.NewDesc(
-			"zfs_pool_write_bytes_total",
-			"Total bytes written to the pool (cumulative counter).",
+		logicalWriteBytes: prometheus.NewDesc(
+			"zfs_pool_logical_write_bytes_total",
+			"Total logical bytes written to the pool via the ARC/DMU path (cumulative counter from iostats).",
+			poolLabels, nil,
+		),
+		physicalReadOps: prometheus.NewDesc(
+			"zfs_pool_physical_read_ops_total",
+			"Total physical read operations completed on pool disks (cumulative counter from /proc/diskstats).",
+			poolLabels, nil,
+		),
+		physicalWriteOps: prometheus.NewDesc(
+			"zfs_pool_physical_write_ops_total",
+			"Total physical write operations completed on pool disks (cumulative counter from /proc/diskstats).",
+			poolLabels, nil,
+		),
+		physicalReadBytes: prometheus.NewDesc(
+			"zfs_pool_physical_read_bytes_total",
+			"Total physical bytes read from pool disks (cumulative counter from /proc/diskstats).",
+			poolLabels, nil,
+		),
+		physicalWriteBytes: prometheus.NewDesc(
+			"zfs_pool_physical_write_bytes_total",
+			"Total physical bytes written to pool disks (cumulative counter from /proc/diskstats).",
 			poolLabels, nil,
 		),
 		logger: logger,
@@ -133,10 +161,14 @@ func (c *PoolCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.readErrors
 	ch <- c.writeErrors
 	ch <- c.checksumErrors
-	ch <- c.ioReadOps
-	ch <- c.ioWriteOps
-	ch <- c.ioReadBytes
-	ch <- c.ioWriteBytes
+	ch <- c.logicalReadOps
+	ch <- c.logicalWriteOps
+	ch <- c.logicalReadBytes
+	ch <- c.logicalWriteBytes
+	ch <- c.physicalReadOps
+	ch <- c.physicalWriteOps
+	ch <- c.physicalReadBytes
+	ch <- c.physicalWriteBytes
 }
 
 // Collect implements prometheus.Collector.
@@ -173,17 +205,32 @@ func (c *PoolCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.checksumErrors, prometheus.GaugeValue, float64(e.checksum), poolName)
 	}
 
-	// Collect I/O stats from /proc/spl/kstat/zfs/<pool>/io.
+	// Collect logical I/O stats from /proc/spl/kstat/zfs/<pool>/iostats.
+	// These represent all I/O requests through the ARC subsystem (cache hits + disk reads).
 	for _, p := range pools {
-		io, err := c.getPoolIO(p.name)
+		io, err := c.getPoolLogicalIO(p.name)
 		if err != nil {
-			c.logger.Debug("failed to collect pool I/O metrics", "pool", p.name, "error", err)
+			c.logger.Debug("failed to collect pool logical I/O metrics", "pool", p.name, "error", err)
 			continue
 		}
-		ch <- prometheus.MustNewConstMetric(c.ioReadOps, prometheus.CounterValue, float64(io.readOps), p.name)
-		ch <- prometheus.MustNewConstMetric(c.ioWriteOps, prometheus.CounterValue, float64(io.writeOps), p.name)
-		ch <- prometheus.MustNewConstMetric(c.ioReadBytes, prometheus.CounterValue, float64(io.readBytes), p.name)
-		ch <- prometheus.MustNewConstMetric(c.ioWriteBytes, prometheus.CounterValue, float64(io.writeBytes), p.name)
+		ch <- prometheus.MustNewConstMetric(c.logicalReadOps, prometheus.CounterValue, float64(io.readOps), p.name)
+		ch <- prometheus.MustNewConstMetric(c.logicalWriteOps, prometheus.CounterValue, float64(io.writeOps), p.name)
+		ch <- prometheus.MustNewConstMetric(c.logicalReadBytes, prometheus.CounterValue, float64(io.readBytes), p.name)
+		ch <- prometheus.MustNewConstMetric(c.logicalWriteBytes, prometheus.CounterValue, float64(io.writeBytes), p.name)
+	}
+
+	// Collect physical disk I/O stats from /proc/diskstats.
+	// Maps each disk to its pool via zpool status, then sums per pool.
+	physIO, err := c.getPoolPhysicalIO(pools)
+	if err != nil {
+		c.logger.Debug("failed to collect pool physical I/O metrics", "error", err)
+	} else {
+		for poolName, pio := range physIO {
+			ch <- prometheus.MustNewConstMetric(c.physicalReadOps, prometheus.CounterValue, float64(pio.readOps), poolName)
+			ch <- prometheus.MustNewConstMetric(c.physicalWriteOps, prometheus.CounterValue, float64(pio.writeOps), poolName)
+			ch <- prometheus.MustNewConstMetric(c.physicalReadBytes, prometheus.CounterValue, float64(pio.readBytes), poolName)
+			ch <- prometheus.MustNewConstMetric(c.physicalWriteBytes, prometheus.CounterValue, float64(pio.writeBytes), poolName)
+		}
 	}
 }
 
@@ -298,7 +345,12 @@ type poolIO struct {
 	writeBytes int64
 }
 
-// getPoolIO reads cumulative I/O counters from /proc/spl/kstat/zfs/<pool>/iostats.
+// getPoolLogicalIO reads cumulative logical I/O counters from /proc/spl/kstat/zfs/<pool>/iostats.
+// These counters track all I/O requests that pass through the ZFS ARC subsystem.
+// "arc_*" fields represent the normal I/O path (includes both cache hits and disk reads).
+// "direct_*" fields represent I/O that bypasses the ARC (rarely used, usually 0).
+// This is LOGICAL I/O — what applications requested from the pool, not what hit physical disks.
+//
 // The file is a key-value format:
 //
 //	name                            type data
@@ -310,7 +362,7 @@ type poolIO struct {
 //	direct_read_bytes               4    0
 //	direct_write_count              4    0
 //	direct_write_bytes              4    0
-func (c *PoolCollector) getPoolIO(poolName string) (poolIO, error) {
+func (c *PoolCollector) getPoolLogicalIO(poolName string) (poolIO, error) {
 	ioPath := c.opts.ProcPath + "/spl/kstat/zfs/" + poolName + "/iostats"
 	cmd := exec.Command("cat", ioPath)
 	var stdout, stderr bytes.Buffer
@@ -341,4 +393,196 @@ func (c *PoolCollector) getPoolIO(poolName string) (poolIO, error) {
 		readBytes:  stats["arc_read_bytes"] + stats["direct_read_bytes"],
 		writeBytes: stats["arc_write_bytes"] + stats["direct_write_bytes"],
 	}, nil
+}
+
+// getPoolDisks parses `zpool status` to extract the disk device names for each pool.
+// It looks for lines in the config section that reference /dev/disk/by-id/ or device names
+// like sda, nvme0n1, etc. Returns a map of pool name → list of short device names (e.g. "sda").
+func (c *PoolCollector) getPoolDisks() (map[string][]string, error) {
+	cmd := c.zpoolCommand("status")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("zpool status failed: %w (%s)", err, stderr.String())
+	}
+
+	result := make(map[string][]string)
+	var currentPool string
+	inConfig := false
+
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		trimmed := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmed, "pool:") {
+			currentPool = strings.TrimSpace(strings.TrimPrefix(trimmed, "pool:"))
+			inConfig = false
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "config:") {
+			inConfig = true
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "errors:") {
+			inConfig = false
+			continue
+		}
+
+		if !inConfig || currentPool == "" {
+			continue
+		}
+
+		fields := strings.Fields(trimmed)
+		if len(fields) < 1 {
+			continue
+		}
+
+		devName := fields[0]
+
+		// Resolve /dev/disk/by-id/ symlinks to get the real device name
+		if strings.Contains(devName, "-") || strings.HasPrefix(devName, "sd") || strings.HasPrefix(devName, "nvme") || strings.HasPrefix(devName, "da") {
+			// Try to resolve via /dev/disk/by-id/ first
+			resolved := c.resolveDeviceName(devName)
+			if resolved != "" {
+				result[currentPool] = append(result[currentPool], resolved)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// resolveDeviceName tries to resolve a device identifier (from zpool status) to a short
+// device name like "sda". It handles:
+//   - Short names already (sda, nvme0n1) → returned as-is
+//   - /dev/disk/by-id/ style names → resolved via symlink
+//   - Names with partition suffixes (-partN) → stripped to get the whole device
+func (c *PoolCollector) resolveDeviceName(devName string) string {
+	// Remove partition suffix if present (e.g. "-part2" or "p1")
+	baseDev := devName
+	for _, suffix := range []string{"-part1", "-part2", "-part3", "-part4", "-part5", "-part6", "-part7", "-part8", "-part9"} {
+		baseDev = strings.TrimSuffix(baseDev, suffix)
+	}
+
+	// If it's already a short name like sda, nvme0n1, etc.
+	if isShortDevName(baseDev) {
+		return baseDev
+	}
+
+	// Try to resolve via /dev/disk/by-id/ symlink
+	byIDPath := filepath.Join(c.opts.ProcPath, "..", "dev", "disk", "by-id", baseDev)
+	if c.opts.IsContainer() {
+		byIDPath = filepath.Join(c.opts.RootfsPath, "dev", "disk", "by-id", baseDev)
+	}
+
+	target, err := os.Readlink(byIDPath)
+	if err != nil {
+		return ""
+	}
+
+	// target is relative like ../../sda
+	shortName := filepath.Base(target)
+	if isShortDevName(shortName) {
+		return shortName
+	}
+
+	return ""
+}
+
+// isShortDevName checks if a name looks like a Linux block device (sda, nvme0n1, etc.)
+func isShortDevName(name string) bool {
+	return strings.HasPrefix(name, "sd") ||
+		strings.HasPrefix(name, "nvme") ||
+		strings.HasPrefix(name, "da") ||
+		strings.HasPrefix(name, "vd") ||
+		strings.HasPrefix(name, "xvd")
+}
+
+// diskStats holds physical I/O counters from /proc/diskstats for a single device.
+type diskStats struct {
+	readsCompleted  int64
+	readBytes       int64
+	writesCompleted int64
+	writeBytes      int64
+}
+
+// parseDiskStats reads /proc/diskstats and returns a map of device name → stats.
+// /proc/diskstats format (kernel 4.18+):
+//
+//	major minor name reads_completed reads_merged read_sectors read_ms
+//	writes_completed writes_merged write_sectors write_ms ...
+//
+// Sectors are always 512 bytes.
+func (c *PoolCollector) parseDiskStats() (map[string]diskStats, error) {
+	diskStatsPath := filepath.Join(c.opts.ProcPath, "diskstats")
+
+	file, err := os.Open(diskStatsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open %s: %w", diskStatsPath, err)
+	}
+	defer file.Close()
+
+	result := make(map[string]diskStats)
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		// /proc/diskstats has at least 14 fields per line
+		if len(fields) < 14 {
+			continue
+		}
+
+		name := fields[2]
+		ds := diskStats{
+			readsCompleted:  parseInt64(fields[3]),
+			readBytes:       parseInt64(fields[5]) * 512, // sectors → bytes
+			writesCompleted: parseInt64(fields[7]),
+			writeBytes:      parseInt64(fields[9]) * 512, // sectors → bytes
+		}
+		result[name] = ds
+	}
+
+	return result, scanner.Err()
+}
+
+// getPoolPhysicalIO maps disks to pools and sums physical I/O from /proc/diskstats.
+// Returns a map of pool name → aggregated physical I/O counters.
+func (c *PoolCollector) getPoolPhysicalIO(pools []pool) (map[string]poolIO, error) {
+	poolDisks, err := c.getPoolDisks()
+	if err != nil {
+		return nil, err
+	}
+
+	allDiskStats, err := c.parseDiskStats()
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]poolIO)
+	for _, p := range pools {
+		disks, ok := poolDisks[p.name]
+		if !ok {
+			continue
+		}
+
+		var pio poolIO
+		for _, diskName := range disks {
+			ds, ok := allDiskStats[diskName]
+			if !ok {
+				c.logger.Debug("disk not found in /proc/diskstats", "disk", diskName, "pool", p.name)
+				continue
+			}
+			pio.readOps += ds.readsCompleted
+			pio.writeOps += ds.writesCompleted
+			pio.readBytes += ds.readBytes
+			pio.writeBytes += ds.writeBytes
+		}
+
+		result[p.name] = pio
+	}
+
+	return result, nil
 }
