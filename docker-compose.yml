@@ -1,0 +1,23 @@
+services:
+  zfs-exporter:
+    # Use a pre-built image from Docker Hub
+    image: docker.io/lfventura/zfs-exporter:latest
+    # To build locally instead, comment the 'image' line above and uncomment:
+    # build: .
+    container_name: zfs_exporter
+    # Use the host PID namespace so chroot into /host can see ZFS kernel state.
+    pid: host
+    privileged: true
+    ports:
+      - "9550:9550"
+    restart: unless-stopped
+    command:
+      - "--path.rootfs=/host"
+      - "--path.procfs=/host/proc"
+      - "--web.listen-address=:9550"
+    volumes:
+      # Mount the entire host filesystem read-only.
+      # This allows chroot /host zfs/zpool to work.
+      - /:/host:ro,rslave
+      # Mount /dev so ZFS device nodes are accessible inside chroot.
+      - /dev:/host/dev:ro
