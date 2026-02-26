@@ -21,6 +21,10 @@ type PoolCollector struct {
 	readErrors       *prometheus.Desc
 	writeErrors      *prometheus.Desc
 	checksumErrors   *prometheus.Desc
+	ioReadOps        *prometheus.Desc
+	ioWriteOps       *prometheus.Desc
+	ioReadBytes      *prometheus.Desc
+	ioWriteBytes     *prometheus.Desc
 
 	opts   Options
 	logger *slog.Logger
@@ -83,6 +87,26 @@ func NewPoolCollector(logger *slog.Logger, opts Options) *PoolCollector {
 			"Total checksum errors for the pool (top-level vdev).",
 			poolLabels, nil,
 		),
+		ioReadOps: prometheus.NewDesc(
+			"zfs_pool_read_ops_total",
+			"Total read operations for the pool (cumulative counter).",
+			poolLabels, nil,
+		),
+		ioWriteOps: prometheus.NewDesc(
+			"zfs_pool_write_ops_total",
+			"Total write operations for the pool (cumulative counter).",
+			poolLabels, nil,
+		),
+		ioReadBytes: prometheus.NewDesc(
+			"zfs_pool_read_bytes_total",
+			"Total bytes read from the pool (cumulative counter).",
+			poolLabels, nil,
+		),
+		ioWriteBytes: prometheus.NewDesc(
+			"zfs_pool_write_bytes_total",
+			"Total bytes written to the pool (cumulative counter).",
+			poolLabels, nil,
+		),
 		logger: logger,
 	}
 }
@@ -109,6 +133,10 @@ func (c *PoolCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.readErrors
 	ch <- c.writeErrors
 	ch <- c.checksumErrors
+	ch <- c.ioReadOps
+	ch <- c.ioWriteOps
+	ch <- c.ioReadBytes
+	ch <- c.ioWriteBytes
 }
 
 // Collect implements prometheus.Collector.
@@ -143,6 +171,19 @@ func (c *PoolCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.readErrors, prometheus.GaugeValue, float64(e.read), poolName)
 		ch <- prometheus.MustNewConstMetric(c.writeErrors, prometheus.GaugeValue, float64(e.write), poolName)
 		ch <- prometheus.MustNewConstMetric(c.checksumErrors, prometheus.GaugeValue, float64(e.checksum), poolName)
+	}
+
+	// Collect I/O stats from /proc/spl/kstat/zfs/<pool>/io.
+	for _, p := range pools {
+		io, err := c.getPoolIO(p.name)
+		if err != nil {
+			c.logger.Debug("failed to collect pool I/O metrics", "pool", p.name, "error", err)
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(c.ioReadOps, prometheus.CounterValue, float64(io.readOps), p.name)
+		ch <- prometheus.MustNewConstMetric(c.ioWriteOps, prometheus.CounterValue, float64(io.writeOps), p.name)
+		ch <- prometheus.MustNewConstMetric(c.ioReadBytes, prometheus.CounterValue, float64(io.readBytes), p.name)
+		ch <- prometheus.MustNewConstMetric(c.ioWriteBytes, prometheus.CounterValue, float64(io.writeBytes), p.name)
 	}
 }
 
@@ -248,4 +289,58 @@ func (c *PoolCollector) getPoolErrors() (map[string]poolErrors, error) {
 	}
 
 	return result, nil
+}
+
+type poolIO struct {
+	readOps  int64
+	writeOps int64
+	readBytes  int64
+	writeBytes int64
+}
+
+// getPoolIO reads cumulative I/O counters from /proc/spl/kstat/zfs/<pool>/io.
+// The file format (Linux) has a header line and a data line with space-separated fields:
+//   nread  nwritten  reads  writes  wtime  wlentime  wupdate  rtime  rlentime  rupdate  wcnt  rcnt
+func (c *PoolCollector) getPoolIO(poolName string) (poolIO, error) {
+	ioPath := c.opts.ProcPath + "/spl/kstat/zfs/" + poolName + "/io"
+	cmd := exec.Command("cat", ioPath)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return poolIO{}, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	// We need at least 3 lines: header comment, column names, data.
+	// Sometimes it's just 2 lines: header and data.
+	var dataLine string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "name") || strings.HasPrefix(line, "type") {
+			continue
+		}
+		// First non-header line is the data line.
+		dataLine = line
+		break
+	}
+
+	if dataLine == "" {
+		return poolIO{}, nil
+	}
+
+	fields := strings.Fields(dataLine)
+	if len(fields) < 4 {
+		c.logger.Warn("unexpected io kstat format", "pool", poolName, "line", dataLine)
+		return poolIO{}, nil
+	}
+
+	// Fields: nread nwritten reads writes ...
+	return poolIO{
+		readBytes:  parseInt64(fields[0]),
+		writeBytes: parseInt64(fields[1]),
+		readOps:    parseInt64(fields[2]),
+		writeOps:   parseInt64(fields[3]),
+	}, nil
 }
